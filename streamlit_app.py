@@ -16,8 +16,8 @@ def get_effective_bin_dims(bin_l, bin_w, clearance_mm):
     """
     Calculates usable bin dimensions based on clearance rules.
     Rule: 
-    - Largest dimension gets full clearance subtracted.
-    - Smallest dimension gets min(3mm, 1/3 * clearance).
+    - Largest dimension gets User Input clearance subtracted.
+    - Smallest dimension gets FIXED 3mm clearance subtracted.
     """
     dims = [bin_l, bin_w]
     dims.sort() # [small, large]
@@ -27,7 +27,7 @@ def get_effective_bin_dims(bin_l, bin_w, clearance_mm):
     
     # Calculate clearances
     clear_large = clearance_mm
-    clear_small = min(3.0, clearance_mm / 3.0)
+    clear_small = 3.0 # FIXED as per new requirement
     
     # Subtract from BIN dimensions
     eff_small = small_dim - clear_small
@@ -119,7 +119,7 @@ def consolidate_drawers(item_results, drawer_db_drawers, clearance_mm):
             total_bins = sum(r['quantity of bins needed'] for r in items)
             capacity = props['QtyBins']
             
-            if capacity == 0: # Handle Empty drawers or bad data
+            if capacity == 0: 
                 drawers_needed = 0
                 free_slots = 0
                 remainder = 0
@@ -221,48 +221,26 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
 
     # STRATEGY 1: EXPAND EXISTING 3" -> 6"
     if strategy == 'expand':
-        # Upgrade map: S3->S6, M3->M6, L3->L6
-        # We need to find rows in summary_df that match S3/M3/L3
-        
-        # Iterate through rows and modify them
-        # Since we might split rows, it's easier to rebuild list
         new_rows = []
-        
-        # Create a price map for upgrades
-        # We need full DB access for prices of S6/M6/L6
         price_map = drawer_db_full.set_index('DrawerID')['Price'].to_dict()
         
         for idx, row in df.iterrows():
             d_type = row['Drawer Type']
-            
-            # Check if this is a 3" drawer that has a 6" counterpart
-            # Simple check: ends with '3' and not Empty
             if d_type.endswith('3') and 'Empty' not in d_type:
                 target_type = d_type.replace('3', '6')
-                
-                # Check if target exists in DB
                 if target_type in price_map:
-                    # How many upgrades do we need to fill the gap?
-                    # Each upgrade gives +3 inches (6-3)
                     upgrades_possible = row['Drawers Required']
                     upgrades_needed = math.ceil(gap / 3)
-                    
                     upgrades_to_perform = min(upgrades_possible, upgrades_needed)
                     
                     if upgrades_to_perform > 0:
-                        # 1. Add Upgraded Row
                         gap_filled = upgrades_to_perform * 3
                         
-                        # We are essentially moving 'upgrades_to_perform' drawers from this row to a new S6 row
-                        # But wait, S6 might already exist in the summary.
-                        # For simplicity in display, we will append new rows and let pandas group them later if needed, 
-                        # or just leave them separate to show the "Expanded" action.
-                        
-                        # Add the UPGRADED portion
+                        # Add upgraded part
                         new_rows.append({
                             "Drawer Type": target_type,
                             "Drawer Height": 6,
-                            "Total Bins Used": 0, # Virtual move, bins are same
+                            "Total Bins Used": 0, # Virtual move
                             "Drawers Required": upgrades_to_perform,
                             "Unit Price": f"${price_map.get(target_type,0):,.2f}",
                             "Total Price": upgrades_to_perform * price_map.get(target_type,0),
@@ -270,34 +248,28 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                             "Notes": "Expanded from 3\""
                         })
                         
-                        # Add the REMAINING portion (if any)
+                        # Add remaining part
                         remaining = upgrades_possible - upgrades_to_perform
                         if remaining > 0:
                             row['Drawers Required'] = remaining
                             row['Vertical Space (in)'] = remaining * 3
-                            # Recalc Total Price based on unit price in string
-                            unit_p = float(row['Unit Price'].replace('$','').replace(',',''))
+                            unit_p = float(str(row['Unit Price']).replace('$','').replace(',',''))
                             row['Total Price'] = remaining * unit_p
                             new_rows.append(row)
                             
                         changes_log.append(f"Expanded {int(upgrades_to_perform)}x {d_type} to {target_type}")
                         gap -= gap_filled
-                        continue # Done with this row
+                        continue 
             
-            # If not modified, keep row
             new_rows.append(row)
-            
         df = pd.DataFrame(new_rows)
     
-    # STRATEGY 2: FILL REMAINING GAP WITH EMPTY DRAWERS
-    # (Runs after expansion if gap remains, or directly if strategy is 'empty')
+    # STRATEGY 2: FILL REMAINING GAP
     if gap > 0:
-        # Fill with 6" empties first, then 3"
         num_e6 = math.floor(gap / 6)
         gap -= num_e6 * 6
-        
-        num_e3 = math.ceil(gap / 3) # Finish rest with 3"
-        gap -= num_e3 * 3 # Should be <= 0 now
+        num_e3 = math.ceil(gap / 3) 
+        gap -= num_e3 * 3 
         
         if num_e6 > 0:
             df = pd.concat([df, pd.DataFrame([{
@@ -325,21 +297,14 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
             }])], ignore_index=True)
             changes_log.append(f"Added {num_e3}x Empty3")
 
-    # Recalculate total height
     new_total_height = df['Vertical Space (in)'].sum()
     return df, new_total_height, changes_log
 
 def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearance_mm, fill_strategy):
-    """
-    Main Optimization Loop.
-    """
     item_results = []
     no_fit_results = []
     
-    # 1. Parse Drawer DB
     cost_rows = drawer_db_full[drawer_db_full['BinWidth'].isna()]
-    # Drawers are rows with defined dimensions OR specifically named "Empty" rows (which have NaNs but we need to keep them for lookup)
-    # Actually, for packing, we only need rows with Dimensions.
     drawer_db_drawers = drawer_db_full[drawer_db_full['BinWidth'].notna()].copy()
     
     base_cabinet_cost = 0
@@ -360,7 +325,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
         else:
              drawer_db_drawers[col] = pd.to_numeric(drawer_db_drawers[col], errors='coerce')
 
-    # 2. Packing Loop
     for index, row in inventory_df.iterrows():
         item_code = row['Material ID/ Product Code']
         raw_qty = float(row['Quantity'])
@@ -377,7 +341,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
         selected_items_per_bin = 0
         selected_drawer_height = 0
 
-        # Try every drawer type
         for _, drawer in drawer_db_drawers.iterrows():
             d_id = drawer['DrawerID']
             b_w = drawer['BinWidth']
@@ -385,7 +348,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
             b_h = drawer['BinHeight']
             b_qty_slots = drawer['QtyBins'] 
             
-            # Skip empty placeholders during packing
             if b_qty_slots <= 0: continue
             
             if b_h > 100:
@@ -393,7 +355,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
             else:
                 drawer_height_inch = 3
             
-            # PASS CLEARANCE HERE
             items_per_bin = check_fit(i_l, i_w, i_h, b_l, b_w, b_h, clearance_mm)
             
             if items_per_bin > 0:
@@ -408,7 +369,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
                     selected_items_per_bin = items_per_bin
                     selected_drawer_height = drawer_height_inch
 
-        # Record Result
         if best_drawer_id:
             item_results.append({
                 "Material ID/ Product Code": item_code,
@@ -420,7 +380,6 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
                 "_raw_dims": (i_l, i_w, i_h)
             })
         else:
-            # IT DOES NOT FIT ANYWHERE
             reason = get_failure_reason(i_l, i_w, i_h, drawer_db_drawers, clearance_mm)
             no_fit_results.append({
                 "Material ID/ Product Code": item_code,
@@ -431,11 +390,9 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
                 "Failure Reason": reason
             })
 
-    # 3. Consolidation
     if enable_consolidation and item_results:
         item_results = consolidate_drawers(item_results, drawer_db_drawers, clearance_mm)
             
-    # 4. Aggregation
     results_df = pd.DataFrame(item_results)
     no_fit_df = pd.DataFrame(no_fit_results)
     
@@ -478,15 +435,12 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearan
         
     summary_df = pd.DataFrame(summary_list)
     
-    # 5. FILL CABINET GAPS
     summary_df, total_cabinet_height, fill_logs = fill_cabinet_gaps(
         summary_df, total_cabinet_height, fill_strategy, drawer_db_full
     )
     
-    # Recalculate financial totals from modified summary
     total_drawer_cost = summary_df['Total Price'].sum()
     
-    # Financials
     cabinets_needed = math.ceil(total_cabinet_height / 33) if total_cabinet_height > 0 else 0
     total_base_cost = cabinets_needed * base_cabinet_cost
     total_shipping_cost = cabinets_needed * shipping_cost
@@ -544,12 +498,14 @@ st.sidebar.divider()
 st.sidebar.header("Settings")
 use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
 
-clearance = st.sidebar.number_input("Bin Clearance (mm)", min_value=0.0, value=10.0, step=1.0, help="Subtracts from bin dimensions. Full amount on largest side, 3mm on shortest.")
+skip_missing_setting = st.sidebar.checkbox("Skip missing items (ignore errors)", value=False, help="If checked, items without dimensions will be ignored instead of stopping calculation.")
+
+clearance = st.sidebar.number_input("Large Dimension Clearance (mm)", min_value=0.0, value=10.0, step=1.0, help="Subtracts this amount from the bin's largest dimension. The smallest dimension gets a fixed 3mm subtraction.")
 
 fill_strat = st.sidebar.selectbox(
     "Cabinet Gap Filling Strategy", 
     ["expand", "empty"],
-    help="Strategies to reach 33 inches:\n'expand': Upgrade 3\" drawers to 6\" to use up space (Best Value).\n'empty': Just add empty drawers."
+    help="Strategies to reach 33 inches:\n'expand': Upgrade 3\" drawers to 6\" to use up space.\n'empty': Just add empty drawers."
 )
 
 if inv_file and prod_file and draw_file:
@@ -603,28 +559,29 @@ if inv_file and prod_file and draw_file:
 
         if not missing_df.empty:
             col_stat2.error(f"⚠️ {len(missing_df)} items missing dimensions.")
-            st.info("Fix or Skip to proceed.")
             
-            c1, c2 = st.columns(2)
-            with c1:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    missing_df.to_excel(writer, index=False)
-                st.download_button("Download Missing Report", buffer, "missing_dims.xlsx")
-                fixed_file = st.file_uploader("Upload Fixed File", type=['xlsx'], key="fix")
-                
-            with c2:
-                skip_missing = st.checkbox("Skip missing items")
-
-            if fixed_file:
-                fixed_df = pd.read_excel(fixed_file)
-                final_df_to_process = pd.concat([valid_df, fixed_df], ignore_index=True)
-                ready_to_calculate = True
-            elif skip_missing:
+            if skip_missing_setting:
+                st.warning(f"Skipping {len(missing_df)} items as per Settings.")
                 final_df_to_process = valid_df
                 ready_to_calculate = True
             else:
-                st.stop()
+                st.info("To proceed, upload fixed data OR enable 'Skip missing items' in Settings.")
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        missing_df.to_excel(writer, index=False)
+                    st.download_button("Download Missing Report", buffer, "missing_dims.xlsx")
+                with c2:
+                    fixed_file = st.file_uploader("Upload Fixed File", type=['xlsx'], key="fix")
+
+                if fixed_file:
+                    fixed_df = pd.read_excel(fixed_file)
+                    final_df_to_process = pd.concat([valid_df, fixed_df], ignore_index=True)
+                    ready_to_calculate = True
+                else:
+                    st.stop()
         else:
             final_df_to_process = valid_df
             ready_to_calculate = True
