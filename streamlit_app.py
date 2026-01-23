@@ -12,71 +12,103 @@ def clean_code(series):
     """Removes spaces from a pandas series (column) for matching."""
     return series.astype(str).str.replace(" ", "").str.strip().str.upper()
 
-def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h):
+def get_effective_bin_dims(bin_l, bin_w, clearance_mm):
     """
-    Determines how many items fit in a SINGLE bin.
-    Returns: count (int)
+    Calculates usable bin dimensions based on clearance rules.
+    Rule: 
+    - Largest dimension gets full clearance subtracted.
+    - Smallest dimension gets min(3mm, 1/3 * clearance).
     """
-    # Check 1: Vertical Height (Stacking)
+    dims = [bin_l, bin_w]
+    dims.sort() # [small, large]
+    
+    small_dim = dims[0]
+    large_dim = dims[1]
+    
+    # Calculate clearances
+    clear_large = clearance_mm
+    clear_small = min(3.0, clearance_mm / 3.0)
+    
+    # Subtract from BIN dimensions
+    eff_small = small_dim - clear_small
+    eff_large = large_dim - clear_large
+    
+    return eff_small, eff_large
+
+def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h, clearance_mm=10):
+    """
+    Determines how many items fit in a SINGLE bin using effective bin dimensions.
+    """
+    # 1. Get Effective Bin Dimensions (Usable Space)
+    eff_bin_small, eff_bin_large = get_effective_bin_dims(bin_l, bin_w, clearance_mm)
+    
+    # If clearance makes bin negative, it fits nothing
+    if eff_bin_small <= 0 or eff_bin_large <= 0:
+        return 0
+
+    # 2. Check Vertical Height (Strict)
     if item_h > bin_h:
         return 0
     vertical_stack = math.floor(bin_h / item_h)
     
-    # Check 2: Footprint (Rotation Allowed)
-    # Option A: Normal Orientation
-    fits_normal = (item_l <= bin_l and item_w <= bin_w)
+    # 3. Check Footprint
+    # Sort item dimensions
+    item_dims = [item_l, item_w]
+    item_dims.sort() # [small, large]
     
-    # Option B: Rotated Orientation
-    fits_rotated = (item_w <= bin_l and item_l <= bin_w)
-    
-    if not (fits_normal or fits_rotated):
-        return 0
-
-    count_normal = 0
-    if fits_normal:
-        count_normal = math.floor(bin_l / item_l) * math.floor(bin_w / item_w)
+    # Check if Item fits in Effective Bin (Small <= Small AND Large <= Large)
+    if item_dims[0] <= eff_bin_small and item_dims[1] <= eff_bin_large:
+        # IT FITS!
+        # Now calculate count based on orientation
         
-    count_rotated = 0
-    if fits_rotated:
-        count_rotated = math.floor(bin_l / item_w) * math.floor(bin_w / item_l)
+        # Orient A: Align Item Long side with Bin Long side
+        count_a = math.floor(eff_bin_large / item_dims[1]) * math.floor(eff_bin_small / item_dims[0])
         
-    base_count = max(count_normal, count_rotated)
+        # Orient B: Align Item Long side with Bin Short side (Only possible if Item Large <= Bin Small)
+        count_b = 0
+        if item_dims[1] <= eff_bin_small:
+            count_b = math.floor(eff_bin_large / item_dims[0]) * math.floor(eff_bin_small / item_dims[1])
+            
+        base_count = max(count_a, count_b)
+        return base_count * vertical_stack
     
-    return base_count * vertical_stack
+    return 0
 
-def get_failure_reason(i_l, i_w, i_h, drawer_db_drawers):
+def get_failure_reason(i_l, i_w, i_h, drawer_db_drawers, clearance_mm):
     """
-    Diagnose why an item didn't fit any drawer.
+    Diagnose why an item didn't fit.
     """
     max_h = drawer_db_drawers['BinHeight'].max()
+    
+    # Find the largest physical bin to check against
     max_l = drawer_db_drawers['BinLength'].max()
     max_w = drawer_db_drawers['BinWidth'].max()
     
-    max_dim_1 = max(max_l, max_w)
-    max_dim_2 = min(max_l, max_w)
+    # Get effective dims of that largest bin
+    eff_max_small, eff_max_large = get_effective_bin_dims(max_l, max_w, clearance_mm)
     
     reasons = []
     
     if i_h > max_h:
-        reasons.append(f"Height {i_h}mm > Max {max_h}mm")
+        reasons.append(f"Height {i_h}mm > Max Available {max_h}mm")
         
-    i_dim_1 = max(i_l, i_w)
-    i_dim_2 = min(i_l, i_w)
+    # Check footprint
+    item_dims = [i_l, i_w]
+    item_dims.sort()
     
-    if i_dim_2 > max_dim_2:
-        reasons.append(f"Width {i_dim_2}mm > Max {max_dim_2}mm")
-    elif i_dim_1 > max_dim_1:
-        reasons.append(f"Length {i_dim_1}mm > Max {max_dim_1}mm")
+    if item_dims[0] > eff_max_small:
+        reasons.append(f"Min Width {item_dims[0]}mm > Max Usable Width {eff_max_small:.1f}mm")
+    elif item_dims[1] > eff_max_large:
+        reasons.append(f"Max Length {item_dims[1]}mm > Max Usable Length {eff_max_large:.1f}mm")
         
     if not reasons:
-        return "Complex Fit Issue (Volume/Shape)"
+        return "Complex Fit Issue (Shape/Volume)"
         
     return "; ".join(reasons)
 
-def consolidate_drawers(item_results, drawer_db_drawers):
+def consolidate_drawers(item_results, drawer_db_drawers, clearance_mm):
     """
-    Advanced Logic:
-    Tries to move items from 'Overflow' drawers into 'Empty Space' of others.
+    Moves overflow items to empty spaces.
     """
     drawer_map = drawer_db_drawers.set_index('DrawerID').to_dict('index')
     
@@ -87,13 +119,17 @@ def consolidate_drawers(item_results, drawer_db_drawers):
             total_bins = sum(r['quantity of bins needed'] for r in items)
             capacity = props['QtyBins']
             
-            drawers_needed = math.ceil(total_bins / capacity)
-            bins_available_total = drawers_needed * capacity
-            free_slots = bins_available_total - total_bins
-            
-            remainder = total_bins % capacity
-            if remainder == 0 and total_bins > 0: remainder = capacity
-            if total_bins == 0: remainder = 0
+            if capacity == 0: # Handle Empty drawers or bad data
+                drawers_needed = 0
+                free_slots = 0
+                remainder = 0
+            else:
+                drawers_needed = math.ceil(total_bins / capacity)
+                bins_available_total = drawers_needed * capacity
+                free_slots = bins_available_total - total_bins
+                remainder = total_bins % capacity
+                if remainder == 0 and total_bins > 0: remainder = capacity
+                if total_bins == 0: remainder = 0
             
             state[d_id] = {
                 'items': items,
@@ -105,8 +141,7 @@ def consolidate_drawers(item_results, drawer_db_drawers):
             }
         return state
 
-    max_passes = 3
-    for _ in range(max_passes):
+    for _ in range(3):
         state = get_drawer_state(item_results)
         changes_made = False
         
@@ -127,18 +162,19 @@ def consolidate_drawers(item_results, drawer_db_drawers):
                     if dest_id == source_id: continue
                     dest_props = drawer_map[dest_id]
                     dest_state = state[dest_id]
-                    
+                    if dest_props['QtyBins'] == 0: continue 
+
                     if '_raw_dims' not in item: continue
                     i_l, i_w, i_h = item['_raw_dims']
                     
                     new_fit = check_fit(i_l, i_w, i_h, 
                                       dest_props['BinLength'], 
                                       dest_props['BinWidth'], 
-                                      dest_props['BinHeight'])
+                                      dest_props['BinHeight'],
+                                      clearance_mm)
                     
                     if new_fit > 0:
-                        qty_req = item['Quantity Requested']
-                        new_bins_needed = math.ceil(qty_req / new_fit)
+                        new_bins_needed = math.ceil(item['Quantity Requested'] / new_fit)
                         if new_bins_needed <= dest_state['free_slots']:
                             best_dest = dest_id
                             break 
@@ -146,32 +182,164 @@ def consolidate_drawers(item_results, drawer_db_drawers):
                 if best_dest:
                     dest_props = drawer_map[best_dest]
                     i_l, i_w, i_h = item['_raw_dims']
-                    new_fit = check_fit(i_l, i_w, i_h, dest_props['BinLength'], dest_props['BinWidth'], dest_props['BinHeight'])
-                    new_bins = math.ceil(item['Quantity Requested'] / new_fit)
+                    new_fit = check_fit(i_l, i_w, i_h, dest_props['BinLength'], dest_props['BinWidth'], dest_props['BinHeight'], clearance_mm)
                     
                     item['Type of drawer'] = best_dest
                     item['quantity per bin'] = new_fit
-                    item['quantity of bins needed'] = new_bins
+                    item['quantity of bins needed'] = math.ceil(item['Quantity Requested'] / new_fit)
                     item['_drawer_height'] = 6 if dest_props['BinHeight'] > 100 else 3
                     
                     changes_made = True
                     break 
-            
             if changes_made: break
         if not changes_made: break
             
     return item_results
 
-def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
+def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full):
+    """
+    Ensures total height is a multiple of 33" by filling the gap.
+    """
+    cabinets_needed = math.ceil(total_height_current / 33)
+    if cabinets_needed == 0: cabinets_needed = 1
+    target_height = cabinets_needed * 33
+    gap = target_height - total_height_current
+    
+    if gap <= 0:
+        return summary_df, total_height_current, []
+
+    df = summary_df.copy()
+    changes_log = []
+    
+    # Get Prices for Empties
+    try:
+        p_e3 = drawer_db_full.loc[drawer_db_full['DrawerID']=='Empty3', 'Price'].values[0]
+    except: p_e3 = 0
+    try:
+        p_e6 = drawer_db_full.loc[drawer_db_full['DrawerID']=='Empty6', 'Price'].values[0]
+    except: p_e6 = 0
+
+    # STRATEGY 1: EXPAND EXISTING 3" -> 6"
+    if strategy == 'expand':
+        # Upgrade map: S3->S6, M3->M6, L3->L6
+        # We need to find rows in summary_df that match S3/M3/L3
+        
+        # Iterate through rows and modify them
+        # Since we might split rows, it's easier to rebuild list
+        new_rows = []
+        
+        # Create a price map for upgrades
+        # We need full DB access for prices of S6/M6/L6
+        price_map = drawer_db_full.set_index('DrawerID')['Price'].to_dict()
+        
+        for idx, row in df.iterrows():
+            d_type = row['Drawer Type']
+            
+            # Check if this is a 3" drawer that has a 6" counterpart
+            # Simple check: ends with '3' and not Empty
+            if d_type.endswith('3') and 'Empty' not in d_type:
+                target_type = d_type.replace('3', '6')
+                
+                # Check if target exists in DB
+                if target_type in price_map:
+                    # How many upgrades do we need to fill the gap?
+                    # Each upgrade gives +3 inches (6-3)
+                    upgrades_possible = row['Drawers Required']
+                    upgrades_needed = math.ceil(gap / 3)
+                    
+                    upgrades_to_perform = min(upgrades_possible, upgrades_needed)
+                    
+                    if upgrades_to_perform > 0:
+                        # 1. Add Upgraded Row
+                        gap_filled = upgrades_to_perform * 3
+                        
+                        # We are essentially moving 'upgrades_to_perform' drawers from this row to a new S6 row
+                        # But wait, S6 might already exist in the summary.
+                        # For simplicity in display, we will append new rows and let pandas group them later if needed, 
+                        # or just leave them separate to show the "Expanded" action.
+                        
+                        # Add the UPGRADED portion
+                        new_rows.append({
+                            "Drawer Type": target_type,
+                            "Drawer Height": 6,
+                            "Total Bins Used": 0, # Virtual move, bins are same
+                            "Drawers Required": upgrades_to_perform,
+                            "Unit Price": f"${price_map.get(target_type,0):,.2f}",
+                            "Total Price": upgrades_to_perform * price_map.get(target_type,0),
+                            "Vertical Space (in)": upgrades_to_perform * 6,
+                            "Notes": "Expanded from 3\""
+                        })
+                        
+                        # Add the REMAINING portion (if any)
+                        remaining = upgrades_possible - upgrades_to_perform
+                        if remaining > 0:
+                            row['Drawers Required'] = remaining
+                            row['Vertical Space (in)'] = remaining * 3
+                            # Recalc Total Price based on unit price in string
+                            unit_p = float(row['Unit Price'].replace('$','').replace(',',''))
+                            row['Total Price'] = remaining * unit_p
+                            new_rows.append(row)
+                            
+                        changes_log.append(f"Expanded {int(upgrades_to_perform)}x {d_type} to {target_type}")
+                        gap -= gap_filled
+                        continue # Done with this row
+            
+            # If not modified, keep row
+            new_rows.append(row)
+            
+        df = pd.DataFrame(new_rows)
+    
+    # STRATEGY 2: FILL REMAINING GAP WITH EMPTY DRAWERS
+    # (Runs after expansion if gap remains, or directly if strategy is 'empty')
+    if gap > 0:
+        # Fill with 6" empties first, then 3"
+        num_e6 = math.floor(gap / 6)
+        gap -= num_e6 * 6
+        
+        num_e3 = math.ceil(gap / 3) # Finish rest with 3"
+        gap -= num_e3 * 3 # Should be <= 0 now
+        
+        if num_e6 > 0:
+            df = pd.concat([df, pd.DataFrame([{
+                "Drawer Type": "Empty6",
+                "Drawer Height": 6,
+                "Total Bins Used": 0,
+                "Drawers Required": num_e6,
+                "Unit Price": f"${p_e6:,.2f}",
+                "Total Price": num_e6 * p_e6,
+                "Vertical Space (in)": num_e6 * 6,
+                "Notes": "Gap Filler"
+            }])], ignore_index=True)
+            changes_log.append(f"Added {num_e6}x Empty6")
+            
+        if num_e3 > 0:
+            df = pd.concat([df, pd.DataFrame([{
+                "Drawer Type": "Empty3",
+                "Drawer Height": 3,
+                "Total Bins Used": 0,
+                "Drawers Required": num_e3,
+                "Unit Price": f"${p_e3:,.2f}",
+                "Total Price": num_e3 * p_e3,
+                "Vertical Space (in)": num_e3 * 3,
+                "Notes": "Gap Filler"
+            }])], ignore_index=True)
+            changes_log.append(f"Added {num_e3}x Empty3")
+
+    # Recalculate total height
+    new_total_height = df['Vertical Space (in)'].sum()
+    return df, new_total_height, changes_log
+
+def optimize_packing(inventory_df, drawer_db_full, enable_consolidation, clearance_mm, fill_strategy):
     """
     Main Optimization Loop.
-    Returns: display_df, summary_df, costs, no_fit_df
     """
     item_results = []
     no_fit_results = []
     
     # 1. Parse Drawer DB
     cost_rows = drawer_db_full[drawer_db_full['BinWidth'].isna()]
+    # Drawers are rows with defined dimensions OR specifically named "Empty" rows (which have NaNs but we need to keep them for lookup)
+    # Actually, for packing, we only need rows with Dimensions.
     drawer_db_drawers = drawer_db_full[drawer_db_full['BinWidth'].notna()].copy()
     
     base_cabinet_cost = 0
@@ -217,12 +385,16 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
             b_h = drawer['BinHeight']
             b_qty_slots = drawer['QtyBins'] 
             
+            # Skip empty placeholders during packing
+            if b_qty_slots <= 0: continue
+            
             if b_h > 100:
                 drawer_height_inch = 6
             else:
                 drawer_height_inch = 3
-                
-            items_per_bin = check_fit(i_l, i_w, i_h, b_l, b_w, b_h)
+            
+            # PASS CLEARANCE HERE
+            items_per_bin = check_fit(i_l, i_w, i_h, b_l, b_w, b_h, clearance_mm)
             
             if items_per_bin > 0:
                 bins_needed = math.ceil(qty_needed / items_per_bin)
@@ -249,7 +421,7 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
             })
         else:
             # IT DOES NOT FIT ANYWHERE
-            reason = get_failure_reason(i_l, i_w, i_h, drawer_db_drawers)
+            reason = get_failure_reason(i_l, i_w, i_h, drawer_db_drawers, clearance_mm)
             no_fit_results.append({
                 "Material ID/ Product Code": item_code,
                 "Quantity": qty_needed,
@@ -259,19 +431,17 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
                 "Failure Reason": reason
             })
 
-    # 3. Consolidation (Only on fitted items)
+    # 3. Consolidation
     if enable_consolidation and item_results:
-        item_results = consolidate_drawers(item_results, drawer_db_drawers)
+        item_results = consolidate_drawers(item_results, drawer_db_drawers, clearance_mm)
             
     # 4. Aggregation
     results_df = pd.DataFrame(item_results)
     no_fit_df = pd.DataFrame(no_fit_results)
     
     if results_df.empty:
-        # Handle case where NOTHING fits
-        return results_df, pd.DataFrame(), {'grand_total':0}, no_fit_df
+        return results_df, pd.DataFrame(), {'grand_total':0}, no_fit_df, []
 
-    # Filter valid just in case
     valid_results = results_df[results_df['Type of drawer'] != "NO FIT"]
     
     drawer_caps = drawer_db_drawers.set_index('DrawerID')['QtyBins'].to_dict()
@@ -302,10 +472,19 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
             "Drawers Required": drawers_count,
             "Unit Price": f"${price_per_drawer:,.2f}",
             "Total Price": type_cost_total, 
-            "Vertical Space (in)": type_height_total
+            "Vertical Space (in)": type_height_total,
+            "Notes": ""
         })
         
     summary_df = pd.DataFrame(summary_list)
+    
+    # 5. FILL CABINET GAPS
+    summary_df, total_cabinet_height, fill_logs = fill_cabinet_gaps(
+        summary_df, total_cabinet_height, fill_strategy, drawer_db_full
+    )
+    
+    # Recalculate financial totals from modified summary
+    total_drawer_cost = summary_df['Total Price'].sum()
     
     # Financials
     cabinets_needed = math.ceil(total_cabinet_height / 33) if total_cabinet_height > 0 else 0
@@ -326,7 +505,7 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
     
     display_df = results_df.drop(columns=['_drawer_height', '_raw_dims'])
     
-    return display_df, summary_df, cost_summary, no_fit_df
+    return display_df, summary_df, cost_summary, no_fit_df, fill_logs
 
 # --- MAIN APP LAYOUT ---
 
@@ -334,25 +513,21 @@ st.title("📦 Vending Machine Cabinet Optimizer")
 
 st.sidebar.header("Data Upload")
 
-# --- TEMPLATE DOWNLOADS ---
 with st.sidebar.expander("📄 Download Templates", expanded=False):
     st.write("Get empty files with correct headers:")
     
-    # 1. Inventory Template
     df_inv_temp = pd.DataFrame(columns=["Material ID/ Product Code", "Quantity", "Length (mm)", "Width (mm)", "Height (mm)"])
     buffer_inv = io.BytesIO()
     with pd.ExcelWriter(buffer_inv, engine='xlsxwriter') as writer:
         df_inv_temp.to_excel(writer, index=False)
     st.download_button("1. Inventory Template", buffer_inv, "template_inventory.xlsx")
     
-    # 2. Product DB Template
     df_prod_temp = pd.DataFrame(columns=["Material ID", "Product Code", "Length (mm)", "Width (mm)", "Height (mm)"])
     buffer_prod = io.BytesIO()
     with pd.ExcelWriter(buffer_prod, engine='xlsxwriter') as writer:
         df_prod_temp.to_excel(writer, index=False)
     st.download_button("2. Product DB Template", buffer_prod, "template_product_db.xlsx")
 
-    # 3. Drawer DB Template
     df_draw_temp = pd.DataFrame(columns=["DrawerID", "BinWidth", "BinLength", "BinHeight", "QtyBins", "Price"])
     buffer_draw = io.BytesIO()
     with pd.ExcelWriter(buffer_draw, engine='xlsxwriter') as writer:
@@ -367,7 +542,15 @@ draw_file = st.sidebar.file_uploader("3. Drawer Database (Excel/CSV)", type=['xl
 
 st.sidebar.divider()
 st.sidebar.header("Settings")
-use_topoff = st.sidebar.checkbox("Enable Cabinet Top-Off", value=True)
+use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
+
+clearance = st.sidebar.number_input("Bin Clearance (mm)", min_value=0.0, value=10.0, step=1.0, help="Subtracts from bin dimensions. Full amount on largest side, 3mm on shortest.")
+
+fill_strat = st.sidebar.selectbox(
+    "Cabinet Gap Filling Strategy", 
+    ["expand", "empty"],
+    help="Strategies to reach 33 inches:\n'expand': Upgrade 3\" drawers to 6\" to use up space (Best Value).\n'empty': Just add empty drawers."
+)
 
 if inv_file and prod_file and draw_file:
     try:
@@ -451,7 +634,13 @@ if inv_file and prod_file and draw_file:
             if st.button("🚀 Calculate", type="primary"):
                 with st.spinner("Optimizing..."):
                     
-                    detail_df, summary_df, costs, no_fit_df = optimize_packing(final_df_to_process, draw_df, enable_consolidation=use_topoff)
+                    detail_df, summary_df, costs, no_fit_df, logs = optimize_packing(
+                        final_df_to_process, 
+                        draw_df, 
+                        enable_consolidation=use_topoff, 
+                        clearance_mm=clearance,
+                        fill_strategy=fill_strat
+                    )
                     
                     st.subheader("Results")
                     
@@ -465,6 +654,11 @@ if inv_file and prod_file and draw_file:
                             no_fit_df.to_excel(writer, index=False)
                         st.download_button("📥 Download 'No Fit' Report", buff_nf, "items_not_packed.xlsx", mime="application/vnd.ms-excel")
                         st.divider()
+                    
+                    if logs:
+                        with st.expander("ℹ️ Cabinet Gap Adjustments (33\" Compliance)"):
+                            for log in logs:
+                                st.text(f"- {log}")
                     
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Total Drawers", f"{int(summary_df['Drawers Required'].sum())}")
