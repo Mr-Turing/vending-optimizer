@@ -496,11 +496,12 @@ draw_file = st.sidebar.file_uploader("3. Drawer Database (Excel/CSV)", type=['xl
 
 st.sidebar.divider()
 st.sidebar.header("Settings")
-use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
 
 skip_missing_setting = st.sidebar.checkbox("Skip missing items (ignore errors)", value=False, help="If checked, items without dimensions will be ignored instead of stopping calculation.")
 
 clearance = st.sidebar.number_input("Large Dimension Clearance (mm)", min_value=0.0, value=10.0, step=1.0, help="Subtracts this amount from the bin's largest dimension. The smallest dimension gets a fixed 3mm subtraction.")
+
+use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
 
 fill_strat = st.sidebar.selectbox(
     "Cabinet Gap Filling Strategy", 
