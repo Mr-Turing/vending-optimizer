@@ -47,28 +47,19 @@ def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h):
 def get_failure_reason(i_l, i_w, i_h, drawer_db_drawers):
     """
     Diagnose why an item didn't fit any drawer.
-    Returns a string explanation.
     """
-    # Calculate absolute max dimensions available across ALL drawers
     max_h = drawer_db_drawers['BinHeight'].max()
     max_l = drawer_db_drawers['BinLength'].max()
     max_w = drawer_db_drawers['BinWidth'].max()
     
-    # Note: L and W are rotatable, so we compare sorted pairs
-    # Bin Footprint Max: The largest bin available
-    # We assume the "Largest" bin has max_l and max_w (usually L6)
-    # But strictly, we should find the bin with the largest min_dim and largest max_dim
-    # For simplification with standard vending bins:
     max_dim_1 = max(max_l, max_w)
     max_dim_2 = min(max_l, max_w)
     
     reasons = []
     
-    # 1. Check Height
     if i_h > max_h:
         reasons.append(f"Height {i_h}mm > Max {max_h}mm")
         
-    # 2. Check Footprint
     i_dim_1 = max(i_l, i_w)
     i_dim_2 = min(i_l, i_w)
     
@@ -89,7 +80,6 @@ def consolidate_drawers(item_results, drawer_db_drawers):
     """
     drawer_map = drawer_db_drawers.set_index('DrawerID').to_dict('index')
     
-    # Helper to recalc state
     def get_drawer_state(current_results):
         state = {}
         for d_id, props in drawer_map.items():
@@ -343,6 +333,34 @@ def optimize_packing(inventory_df, drawer_db_full, enable_consolidation=True):
 st.title("📦 Vending Machine Cabinet Optimizer")
 
 st.sidebar.header("Data Upload")
+
+# --- TEMPLATE DOWNLOADS ---
+with st.sidebar.expander("📄 Download Templates", expanded=False):
+    st.write("Get empty files with correct headers:")
+    
+    # 1. Inventory Template
+    df_inv_temp = pd.DataFrame(columns=["Material ID/ Product Code", "Quantity", "Length (mm)", "Width (mm)", "Height (mm)"])
+    buffer_inv = io.BytesIO()
+    with pd.ExcelWriter(buffer_inv, engine='xlsxwriter') as writer:
+        df_inv_temp.to_excel(writer, index=False)
+    st.download_button("1. Inventory Template", buffer_inv, "template_inventory.xlsx")
+    
+    # 2. Product DB Template
+    df_prod_temp = pd.DataFrame(columns=["Material ID", "Product Code", "Length (mm)", "Width (mm)", "Height (mm)"])
+    buffer_prod = io.BytesIO()
+    with pd.ExcelWriter(buffer_prod, engine='xlsxwriter') as writer:
+        df_prod_temp.to_excel(writer, index=False)
+    st.download_button("2. Product DB Template", buffer_prod, "template_product_db.xlsx")
+
+    # 3. Drawer DB Template
+    df_draw_temp = pd.DataFrame(columns=["DrawerID", "BinWidth", "BinLength", "BinHeight", "QtyBins", "Price"])
+    buffer_draw = io.BytesIO()
+    with pd.ExcelWriter(buffer_draw, engine='xlsxwriter') as writer:
+        df_draw_temp.to_excel(writer, index=False)
+    st.download_button("3. Drawer DB Template", buffer_draw, "template_drawer_db.xlsx")
+
+st.sidebar.divider()
+
 inv_file = st.sidebar.file_uploader("1. Inventory Input (Excel)", type=['xlsx'])
 prod_file = st.sidebar.file_uploader("2. Product Database (Excel)", type=['xlsx'])
 draw_file = st.sidebar.file_uploader("3. Drawer Database (Excel/CSV)", type=['xlsx', 'csv'])
@@ -437,26 +455,22 @@ if inv_file and prod_file and draw_file:
                     
                     st.subheader("Results")
                     
-                    # --- NO FIT WARNING ---
                     if not no_fit_df.empty:
                         st.error(f"⚠️ {len(no_fit_df)} items could not fit in ANY drawer!")
                         with st.expander("See Items That Didn't Fit"):
                             st.dataframe(no_fit_df)
                             
-                        # Download No Fit
                         buff_nf = io.BytesIO()
                         with pd.ExcelWriter(buff_nf, engine='xlsxwriter') as writer:
                             no_fit_df.to_excel(writer, index=False)
                         st.download_button("📥 Download 'No Fit' Report", buff_nf, "items_not_packed.xlsx", mime="application/vnd.ms-excel")
                         st.divider()
                     
-                    # Metrics
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Total Drawers", f"{int(summary_df['Drawers Required'].sum())}")
                     m2.metric("Total Vertical Height", f"{int(costs['total_height'])}\"")
                     m3.metric("Cabinets Needed", f"{costs['cabinets_needed']}")
                     
-                    # Financials
                     st.subheader("💰 Financials")
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Drawer Cost", f"${costs['drawer_subtotal']:,.2f}")
@@ -464,14 +478,12 @@ if inv_file and prod_file and draw_file:
                     c3.metric("Shipping", f"${costs['shipping_subtotal']:,.2f}")
                     c4.metric("GRAND TOTAL", f"${costs['grand_total']:,.2f}", delta_color="inverse")
                     
-                    # Data Tabs
                     t1, t2 = st.tabs(["Summary Order", "Pick List"])
                     with t1:
                         st.dataframe(summary_df, use_container_width=True)
                     with t2:
                         st.dataframe(detail_df, use_container_width=True)
                     
-                    # Final Download
                     buffer_res = io.BytesIO()
                     with pd.ExcelWriter(buffer_res, engine='xlsxwriter') as writer:
                         summary_df.to_excel(writer, sheet_name="Summary Order", index=False)
