@@ -14,8 +14,7 @@ def clean_code(series):
 
 def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h):
     """
-    Determines how many items fit in a bin considering rotation and stacking.
-    Returns the maximum number of items per single bin.
+    Determines how many items fit in a SINGLE bin.
     """
     # Check 1: Vertical Height (Stacking)
     if item_h > bin_h:
@@ -46,9 +45,12 @@ def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h):
 
 def optimize_packing(inventory_df, drawer_db_df):
     """
-    Core Logic: Minimize TOTAL DRAWER HEIGHT required.
+    New Logic: 
+    1. For each item, find the drawer type that minimizes 'Cabinet Height Share'.
+    2. Aggregate total bins needed per drawer type.
+    3. Calculate total drawers.
     """
-    results = []
+    item_results = []
     
     # Ensure Drawer DB columns are numeric
     cols_to_num = ['BinWidth', 'BinLength', 'BinHeight', 'QtyBins']
@@ -57,26 +59,30 @@ def optimize_packing(inventory_df, drawer_db_df):
 
     for index, row in inventory_df.iterrows():
         item_code = row['Material ID/ Product Code']
-        qty_needed = row['Quantity']
+        
+        # 1. Round Quantity UP (Decimal -> Integer)
+        raw_qty = float(row['Quantity'])
+        qty_needed = math.ceil(raw_qty) 
         
         # Item Dims
         i_l = float(row['Length (mm)'])
         i_w = float(row['Width (mm)'])
         i_h = float(row['Height (mm)'])
         
-        best_drawer = None
-        min_total_height_cost = float('inf')
-        best_qty_per_drawer = 0
-        best_drawer_qty_needed = 0
-        best_drawer_height_inch = 0
+        best_drawer_id = None
+        min_cost_share = float('inf')
+        
+        selected_bins_needed = 0
+        selected_items_per_bin = 0
+        selected_drawer_height = 0
 
-        # Try every drawer type
+        # Try every drawer type to find the best fit for THIS item
         for _, drawer in drawer_db_df.iterrows():
             d_id = drawer['DrawerID']
             b_w = drawer['BinWidth']
             b_l = drawer['BinLength']
             b_h = drawer['BinHeight']
-            b_qty = drawer['QtyBins']
+            b_qty_slots = drawer['QtyBins'] # How many bins fit in this drawer
             
             # Infer Drawer Height (3" vs 6")
             if b_h > 100:
@@ -87,42 +93,83 @@ def optimize_packing(inventory_df, drawer_db_df):
             items_per_bin = check_fit(i_l, i_w, i_h, b_l, b_w, b_h)
             
             if items_per_bin > 0:
-                total_capacity_per_drawer = items_per_bin * b_qty
-                drawers_needed = math.ceil(qty_needed / total_capacity_per_drawer)
+                # How many bins does this item need?
+                bins_needed = math.ceil(qty_needed / items_per_bin)
                 
-                # Cost function: Total vertical cabinet inches used
-                total_height_cost = drawers_needed * drawer_height_inch
+                # COST FUNCTION: What share of the cabinet height does this consume?
+                # Share = (Bins used / Total Bins in Drawer) * Drawer Height
+                # This prioritizes high density drawers but penalizes using a huge drawer for 1 tiny item
+                drawer_usage_fraction = bins_needed / b_qty_slots
+                height_cost_share = drawer_usage_fraction * drawer_height_inch
                 
-                if total_height_cost < min_total_height_cost:
-                    min_total_height_cost = total_height_cost
-                    best_drawer = d_id
-                    best_qty_per_drawer = total_capacity_per_drawer
-                    best_drawer_qty_needed = drawers_needed
-                    best_drawer_height_inch = drawer_height_inch
+                if height_cost_share < min_cost_share:
+                    min_cost_share = height_cost_share
+                    best_drawer_id = d_id
+                    selected_bins_needed = bins_needed
+                    selected_items_per_bin = items_per_bin
+                    selected_drawer_height = drawer_height_inch
 
-        # Record Result
-        if best_drawer:
-            results.append({
+        # Record Result for this Item
+        if best_drawer_id:
+            item_results.append({
                 "Material ID/ Product Code": item_code,
-                "Quantity": qty_needed,
-                "Best Drawer Type": best_drawer,
-                "Drawer Height (in)": best_drawer_height_inch,
-                "Items Per Drawer": best_qty_per_drawer,
-                "Drawers Required": best_drawer_qty_needed,
-                "Total Height Required (in)": min_total_height_cost
+                "Quantity Requested": qty_needed, # Rounded
+                "Best Drawer Type": best_drawer_id,
+                "Drawer Height (in)": selected_drawer_height,
+                "Items Per Bin": selected_items_per_bin,
+                "Bins Needed": selected_bins_needed,
+                "Cabinet Height Share (in)": min_cost_share
             })
         else:
-            results.append({
+            item_results.append({
                 "Material ID/ Product Code": item_code,
-                "Quantity": qty_needed,
+                "Quantity Requested": qty_needed,
                 "Best Drawer Type": "NO FIT",
                 "Drawer Height (in)": 0,
-                "Items Per Drawer": 0,
-                "Drawers Required": 0,
-                "Total Height Required (in)": 0
+                "Items Per Bin": 0,
+                "Bins Needed": 0,
+                "Cabinet Height Share (in)": 0
             })
             
-    return pd.DataFrame(results)
+    # --- AGGREGATION STEP ---
+    # Now we sum up the bins needed for each drawer type
+    results_df = pd.DataFrame(item_results)
+    
+    # Filter out NO FIT for calculation
+    valid_results = results_df[results_df['Best Drawer Type'] != "NO FIT"]
+    
+    # Group by Drawer Type
+    summary_list = []
+    
+    # We need the 'QtyBins' from the DB again to calculate total drawers
+    # Create a lookup map for drawer capacities
+    drawer_caps = drawer_db_df.set_index('DrawerID')['QtyBins'].to_dict()
+
+    grouped = valid_results.groupby(['Best Drawer Type', 'Drawer Height (in)'])
+    
+    total_cabinet_height = 0
+    
+    for (d_type, d_height), group in grouped:
+        total_bins_needed = group['Bins Needed'].sum()
+        bins_per_drawer = drawer_caps.get(d_type, 1) # Default to 1 to avoid div/0
+        
+        # Calculate Drawers needed for this type (Mixed SKUs allowed in same drawer)
+        drawers_count = math.ceil(total_bins_needed / bins_per_drawer)
+        
+        type_height_total = drawers_count * d_height
+        total_cabinet_height += type_height_total
+        
+        summary_list.append({
+            "Drawer Type": d_type,
+            "Drawer Height": d_height,
+            "Total Bins Used": total_bins_needed,
+            "Drawers Required": drawers_count,
+            "Vertical Space (in)": type_height_total
+        })
+        
+    summary_df = pd.DataFrame(summary_list)
+    
+    return results_df, summary_df, total_cabinet_height
 
 # --- MAIN APP LAYOUT ---
 
@@ -167,7 +214,7 @@ if inv_file and prod_file and draw_file:
                 return match_prod.iloc[0][col_name]
             return None
 
-        # Handling Typo in Height (Just in case)
+        # Handling Typo
         if 'Heigth (mm)' in prod_df.columns:
             prod_df.rename(columns={'Heigth (mm)': 'Height (mm)'}, inplace=True)
         if 'Heigth (mm)' in inv_df.columns:
@@ -199,7 +246,6 @@ if inv_file and prod_file and draw_file:
             
             with col_act1:
                 st.markdown("**Option A: Fix Missing Data**")
-                # 1. Download
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                     missing_df.to_excel(writer, index=False)
@@ -209,18 +255,15 @@ if inv_file and prod_file and draw_file:
                     file_name="items_missing_dimensions.xlsx",
                     mime="application/vnd.ms-excel"
                 )
-                # 2. Upload Fix
                 fixed_file = st.file_uploader("2. Upload Corrected File", type=['xlsx'], key="fix_upload")
                 
             with col_act2:
                 st.markdown("**Option B: Ignore Missing**")
                 skip_missing = st.checkbox("Skip missing items and calculate only valid ones")
 
-            # Logic to Determine Final Dataset
             if fixed_file:
                 try:
                     fixed_df = pd.read_excel(fixed_file)
-                    # We assume user filled in the columns. Combine with valid_df
                     final_df_to_process = pd.concat([valid_df, fixed_df], ignore_index=True)
                     st.success(f"Fixed file uploaded! Total items to process: {len(final_df_to_process)}")
                     ready_to_calculate = True
@@ -233,10 +276,8 @@ if inv_file and prod_file and draw_file:
                 ready_to_calculate = True
             
             else:
-                st.stop() # Stop execution until user takes action
-                
+                st.stop()
         else:
-            # No missing items
             final_df_to_process = valid_df
             ready_to_calculate = True
 
@@ -245,39 +286,38 @@ if inv_file and prod_file and draw_file:
             st.divider()
             if st.button("🚀 Calculate Drawer Configuration", type="primary"):
                 with st.spinner("Optimizing bin packing..."):
-                    result_df = optimize_packing(final_df_to_process, draw_df)
+                    
+                    # Call new logic
+                    detail_df, summary_df, total_height_val = optimize_packing(final_df_to_process, draw_df)
                     
                     # --- STAGE 3: RESULTS ---
                     st.subheader("Results")
                     
                     # Metrics
-                    total_drawers = result_df['Drawers Required'].sum()
-                    total_height_inches = result_df['Total Height Required (in)'].sum()
-                    cabinets_needed = math.ceil(total_height_inches / 33)
+                    total_drawers = summary_df['Drawers Required'].sum()
+                    cabinets_needed = math.ceil(total_height_val / 33)
                     
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Total Drawers", f"{int(total_drawers)}")
-                    m2.metric("Total Vertical Height", f"{int(total_height_inches)}\"")
+                    m2.metric("Total Vertical Height", f"{int(total_height_val)}\"")
                     m3.metric("Cabinets Needed (Max 33\")", f"{cabinets_needed}")
                     
-                    # Breakdowns
-                    t1, t2 = st.tabs(["Summary", "Detailed Pick List"])
+                    # Tabs for data
+                    t1, t2 = st.tabs(["Summary (Order This)", "Detailed Pick List"])
                     
                     with t1:
-                        summary = result_df.groupby(['Best Drawer Type', 'Drawer Height (in)']).agg(
-                            Total_Drawers=('Drawers Required', 'sum'),
-                            Items_Stored=('Quantity', 'count')
-                        ).reset_index()
-                        st.dataframe(summary, use_container_width=True)
+                        st.markdown("#### Drawers to Order")
+                        st.dataframe(summary_df, use_container_width=True)
                     
                     with t2:
-                        st.dataframe(result_df, use_container_width=True)
+                        st.markdown("#### Bin Assignments")
+                        st.dataframe(detail_df, use_container_width=True)
                     
                     # Download
                     buffer_res = io.BytesIO()
                     with pd.ExcelWriter(buffer_res, engine='xlsxwriter') as writer:
-                        result_df.to_excel(writer, sheet_name="Pick List", index=False)
-                        summary.to_excel(writer, sheet_name="Summary", index=False)
+                        summary_df.to_excel(writer, sheet_name="Summary Order", index=False)
+                        detail_df.to_excel(writer, sheet_name="Pick List", index=False)
                         
                     st.download_button(
                         label="📥 Download Final Layout Report",
