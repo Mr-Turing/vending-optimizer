@@ -236,7 +236,7 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                     if upgrades_to_perform > 0:
                         gap_filled = upgrades_to_perform * 3
                         
-                        # Add upgraded part
+                        # Add upgraded part (AS DICT)
                         new_rows.append({
                             "Drawer Type": target_type,
                             "Drawer Height": 6,
@@ -248,20 +248,22 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                             "Notes": "Expanded from 3\""
                         })
                         
-                        # Add remaining part
+                        # Add remaining part (AS DICT)
                         remaining = upgrades_possible - upgrades_to_perform
                         if remaining > 0:
                             row['Drawers Required'] = remaining
                             row['Vertical Space (in)'] = remaining * 3
                             unit_p = float(str(row['Unit Price']).replace('$','').replace(',',''))
                             row['Total Price'] = remaining * unit_p
-                            new_rows.append(row)
+                            new_rows.append(row.to_dict()) # Convert Series to Dict
                             
                         changes_log.append(f"Expanded {int(upgrades_to_perform)}x {d_type} to {target_type}")
                         gap -= gap_filled
                         continue 
             
-            new_rows.append(row)
+            # Unchanged row (AS DICT)
+            new_rows.append(row.to_dict()) # Convert Series to Dict
+            
         df = pd.DataFrame(new_rows)
     
     # STRATEGY 2: FILL REMAINING GAP
@@ -496,12 +498,11 @@ draw_file = st.sidebar.file_uploader("3. Drawer Database (Excel/CSV)", type=['xl
 
 st.sidebar.divider()
 st.sidebar.header("Settings")
+use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
 
 skip_missing_setting = st.sidebar.checkbox("Skip missing items (ignore errors)", value=False, help="If checked, items without dimensions will be ignored instead of stopping calculation.")
 
 clearance = st.sidebar.number_input("Large Dimension Clearance (mm)", min_value=0.0, value=10.0, step=1.0, help="Subtracts this amount from the bin's largest dimension. The smallest dimension gets a fixed 3mm subtraction.")
-
-use_topoff = st.sidebar.checkbox("Enable Drawer Consolidation", value=True, help="Moves overflow items to empty space in other drawers.")
 
 fill_strat = st.sidebar.selectbox(
     "Cabinet Gap Filling Strategy", 
