@@ -201,25 +201,35 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                     upgrades_possible = row['Drawers Required']
                     upgrades_needed = math.ceil(gap / 3)
                     upgrades_to_perform = min(upgrades_possible, upgrades_needed)
+                    
                     if upgrades_to_perform > 0:
                         gap_filled = upgrades_to_perform * 3
+                        
+                        # Calculate proportional bin usage
+                        # Assumption: bins are distributed evenly among drawers
+                        avg_bins_per_drawer = row['Total Bins Used'] / row['Drawers Required']
+                        bins_moving = avg_bins_per_drawer * upgrades_to_perform
+                        
                         new_rows.append({
                             "Drawer Type": target_type,
                             "Drawer Height": 6,
-                            "Total Bins Used": 0,
+                            "Total Bins Used": bins_moving, # Carry over the usage count
                             "Drawers Required": upgrades_to_perform,
                             "Unit Price": f"${price_map.get(target_type,0):,.2f}",
                             "Total Price": upgrades_to_perform * price_map.get(target_type,0),
                             "Vertical Space (in)": upgrades_to_perform * 6,
                             "Notes": "Expanded from 3\""
                         })
+                        
                         remaining = upgrades_possible - upgrades_to_perform
                         if remaining > 0:
                             row['Drawers Required'] = remaining
                             row['Vertical Space (in)'] = remaining * 3
+                            row['Total Bins Used'] = row['Total Bins Used'] - bins_moving # Adjust remaining
                             unit_p = float(str(row['Unit Price']).replace('$','').replace(',',''))
                             row['Total Price'] = remaining * unit_p
                             new_rows.append(row.to_dict())
+                            
                         changes_log.append(f"Expanded {int(upgrades_to_perform)}x {d_type} to {target_type}")
                         gap -= gap_filled
                         continue 
@@ -247,29 +257,19 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
     new_total_height = df['Vertical Space (in)'].sum()
     return df, new_total_height, changes_log
 
+@st.cache_data
 def build_product_map(prod_df):
     """
     Creates a master dictionary for O(1) matching.
-    Keys: Cleaned versions of Material ID, Ordering Code, Packed Code, ANSI.
-    Value: Dict with Dimensions and Package Quantity.
+    Cached to run only once per file upload.
     """
     product_map = {}
-    
-    # Identify key columns based on new file format
-    # Using defaults based on your file, but allowing fallback
-    
-    # 1. Dimensions (Priority: Packed > Unpacked)
-    # Your file has: Length Packed Product Metric, Width..., Height...
-    
     for idx, row in prod_df.iterrows():
-        # Extract Data
-        # Default to 0 if missing
         l = row.get('Length Packed Product Metric', 0)
         w = row.get('Width Packed Product Metric', 0)
         h = row.get('Height Packed Product Metric', 0)
         pkg_qty = row.get('Package Quantity', 1)
         
-        # Validation: If pkg_qty is 0 or NaN, assume 1 to avoid div/0
         if pd.isna(pkg_qty) or pkg_qty <= 0: pkg_qty = 1
         
         data_packet = {
@@ -280,7 +280,6 @@ def build_product_map(prod_df):
             'Desc': str(row.get('Item Description', ''))
         }
         
-        # Map ALL valid identifiers to this data
         keys_to_map = [
             row.get('Material ID'),
             row.get('Ordering Code'),
@@ -320,45 +319,31 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
     for index, row in inventory_df.iterrows():
         input_code_raw = row['Material ID/ Product Code']
         match_id = clean_code_str(input_code_raw)
-        
         req_qty_pieces = float(row['Quantity'])
         
         # 1. Lookup Product Data
         prod_data = product_map.get(match_id)
         
         if prod_data:
-            # FOUND IN DB
-            i_l = prod_data['L']
-            i_w = prod_data['W']
-            i_h = prod_data['H']
+            i_l, i_w, i_h = prod_data['L'], prod_data['W'], prod_data['H']
             pkg_qty = prod_data['PkgQty']
-            
-            # Calculate PACKAGES needed (Storage Units)
-            # e.g. Need 23 items, Pkg=10 -> Need 3 Packs
             packages_needed = math.ceil(req_qty_pieces / pkg_qty)
-            
             is_alien = False
         else:
-            # NOT IN DB - Check for manual dims (Alien Item)
             i_l = float(row.get('Length (mm)', 0)) if pd.notnull(row.get('Length (mm)')) else 0
             i_w = float(row.get('Width (mm)', 0)) if pd.notnull(row.get('Width (mm)')) else 0
             i_h = float(row.get('Height (mm)', 0)) if pd.notnull(row.get('Height (mm)')) else 0
             
             if i_l > 0 and i_w > 0 and i_h > 0:
-                # Alien item logic: Assume User Input Quantity = Storage Units
-                # (User usually counts boxes for aliens, or items are loose)
                 packages_needed = math.ceil(req_qty_pieces)
                 pkg_qty = 1
                 is_alien = True
             else:
-                # DATA MISSING
-                # (This loop shouldn't really trigger if we pre-filtered, but good for safety)
                 continue
 
-        # 2. Optimization Logic (Packing)
+        # 2. Optimization Logic
         best_drawer_id = None
         min_cost_share = float('inf')
-        
         selected_bins_needed = 0
         selected_items_per_bin = 0
         selected_drawer_height = 0
@@ -435,6 +420,7 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
         type_cost_total = drawers_count * price_per_drawer
         total_cabinet_height += type_height_total
         
+        # Kept as float for calculation, will format later
         summary_list.append({
             "Drawer Type": d_type,
             "Drawer Height": d_height,
@@ -449,6 +435,28 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
     summary_df = pd.DataFrame(summary_list)
     summary_df, total_cabinet_height, fill_logs = fill_cabinet_gaps(summary_df, total_cabinet_height, fill_strategy, drawer_db_full)
     
+    # --- FINAL FORMATTING PASS (X of Y) ---
+    formatted_rows = []
+    for idx, row in summary_df.iterrows():
+        d_type = row['Drawer Type']
+        bins_used = row['Total Bins Used']
+        drawers = row['Drawers Required']
+        
+        # Look up capacity per drawer
+        cap_per_drawer = drawer_caps.get(d_type, 0)
+        total_cap = drawers * cap_per_drawer
+        
+        # Format "X of Y"
+        if total_cap > 0:
+            row['Total Bins Used'] = f"{int(bins_used)} of {int(total_cap)}"
+        else:
+            row['Total Bins Used'] = "0 of 0" # Empty drawers
+            
+        formatted_rows.append(row)
+    
+    summary_df = pd.DataFrame(formatted_rows)
+    # --------------------------------------
+
     total_drawer_cost = summary_df['Total Price'].sum()
     cabinets_needed = math.ceil(total_cabinet_height / 33) if total_cabinet_height > 0 else 0
     total_base_cost = cabinets_needed * base_cabinet_cost
@@ -478,14 +486,12 @@ st.sidebar.header("Data Upload")
 with st.sidebar.expander("📄 Download Templates", expanded=False):
     st.write("Get empty files with correct headers:")
     
-    # 1. Inventory Template
     df_inv_temp = pd.DataFrame(columns=["Material ID/ Product Code", "Quantity", "Length (mm)", "Width (mm)", "Height (mm)"])
     buffer_inv = io.BytesIO()
     with pd.ExcelWriter(buffer_inv, engine='xlsxwriter') as writer:
         df_inv_temp.to_excel(writer, index=False)
     st.download_button("1. Inventory Template", buffer_inv, "template_inventory.xlsx")
     
-    # 2. Product DB Template (UPDATED)
     df_prod_temp = pd.DataFrame(columns=[
         "Material ID", "Ordering Code", "Ordering Code Packed", "Ordering Code ANSI", 
         "Package Quantity", "Length Packed Product Metric", "Width Packed Product Metric", "Height Packed Product Metric", "Item Description"
@@ -495,7 +501,6 @@ with st.sidebar.expander("📄 Download Templates", expanded=False):
         df_prod_temp.to_excel(writer, index=False)
     st.download_button("2. Product DB Template", buffer_prod, "template_product_db.xlsx")
 
-    # 3. Drawer DB Template
     df_draw_temp = pd.DataFrame(columns=["DrawerID", "BinWidth", "BinLength", "BinHeight", "QtyBins", "Price"])
     buffer_draw = io.BytesIO()
     with pd.ExcelWriter(buffer_draw, engine='xlsxwriter') as writer:
@@ -505,7 +510,7 @@ with st.sidebar.expander("📄 Download Templates", expanded=False):
 st.sidebar.divider()
 
 inv_file = st.sidebar.file_uploader("1. Inventory Input (Excel)", type=['xlsx'])
-prod_file = st.sidebar.file_uploader("2. Product Database (Excel)", type=['xlsx', 'csv']) # Allow CSV now too
+prod_file = st.sidebar.file_uploader("2. Product Database (Excel)", type=['xlsx', 'csv'])
 draw_file = st.sidebar.file_uploader("3. Drawer Database (Excel/CSV)", type=['xlsx', 'csv'])
 
 st.sidebar.divider()
@@ -520,7 +525,6 @@ if inv_file and prod_file and draw_file:
         # Load Files
         inv_df = pd.read_excel(inv_file)
         
-        # Product DB might be CSV now based on user file
         if prod_file.name.endswith('.csv'):
             prod_df = pd.read_csv(prod_file)
         else:
@@ -536,19 +540,18 @@ if inv_file and prod_file and draw_file:
         prod_df.columns = prod_df.columns.str.strip()
         draw_df.columns = draw_df.columns.str.strip()
         
+        # --- BUILD INDEX (CACHED) ---
+        with st.spinner("Indexing Product DB..."):
+            product_map = build_product_map(prod_df)
+
         st.subheader("Step 1: Data Matching")
         
-        # Build Master Lookup
-        with st.spinner("Building Product Index..."):
-            product_map = build_product_map(prod_df)
-            
-        # Check matches
+        # Check matches using the cached map
         inv_df['Match_ID'] = inv_df['Material ID/ Product Code'].apply(clean_code_str)
         
         def check_status(row):
             if row['Match_ID'] in product_map:
                 return "OK"
-            # Check if alien (manual dims provided)
             l = row.get('Length (mm)')
             w = row.get('Width (mm)')
             h = row.get('Height (mm)')
