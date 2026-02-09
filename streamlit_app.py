@@ -9,46 +9,51 @@ st.set_page_config(page_title="Vending Cabinet Optimizer", layout="wide")
 # --- HELPER FUNCTIONS ---
 
 def clean_code_str(val):
-    """Helper to clean a single string value."""
+    """
+    Robust cleaner:
+    1. Handles NaN/None.
+    2. Replaces Non-Breaking Spaces (\u00A0, \xa0) with standard spaces.
+    3. Removes ALL whitespace (spaces, tabs, newlines).
+    4. Converts to Uppercase.
+    """
     if pd.isna(val) or val == "":
         return None
-    return str(val).replace(" ", "").strip().upper()
+    
+    # Convert to string
+    s = str(val)
+    
+    # Replace non-breaking spaces (Unicode 00A0) with empty string directly
+    # or replace with space then strip. Since we remove ALL spaces anyway:
+    s = s.replace('\u00A0', '').replace('\xa0', '')
+    
+    # Remove standard spaces and other whitespace
+    return s.replace(" ", "").strip().upper()
 
 def get_effective_bin_dims(bin_l, bin_w, clearance_mm):
     """
-    Calculates usable bin dimensions based on clearance rules.
-    Rule: 
-    - Largest dimension gets User Input clearance subtracted.
-    - Smallest dimension gets FIXED 3mm clearance subtracted.
+    Calculates usable bin dimensions.
+    Rule: Largest dim gets User Clearance. Smallest gets FIXED 3mm.
     """
     dims = [bin_l, bin_w]
     dims.sort() # [small, large]
     
-    small_dim = dims[0]
-    large_dim = dims[1]
-    
-    # Calculate clearances
-    clear_large = clearance_mm
-    clear_small = 3.0 # FIXED as per new requirement
-    
-    # Subtract from BIN dimensions
-    eff_small = small_dim - clear_small
-    eff_large = large_dim - clear_large
+    # Fixed 3mm for small side, User Input for large side
+    eff_small = dims[0] - 3.0
+    eff_large = dims[1] - clearance_mm
     
     return eff_small, eff_large
 
 def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h, clearance_mm=10):
     """
-    Determines how many items fit in a SINGLE bin using effective bin dimensions.
+    Determines how many items fit in a SINGLE bin.
     """
     eff_bin_small, eff_bin_large = get_effective_bin_dims(bin_l, bin_w, clearance_mm)
     
-    if eff_bin_small <= 0 or eff_bin_large <= 0:
-        return 0
-
-    if item_h > bin_h:
-        return 0
+    if eff_bin_small <= 0 or eff_bin_large <= 0: return 0
+    if item_h > bin_h: return 0
+    
     vertical_stack = math.floor(bin_h / item_h)
+    if vertical_stack == 0: return 0
     
     item_dims = [item_l, item_w]
     item_dims.sort()
@@ -61,8 +66,7 @@ def check_fit(item_l, item_w, item_h, bin_l, bin_w, bin_h, clearance_mm=10):
         if item_dims[1] <= eff_bin_small:
             count_b = math.floor(eff_bin_large / item_dims[0]) * math.floor(eff_bin_small / item_dims[1])
             
-        base_count = max(count_a, count_b)
-        return base_count * vertical_stack
+        return max(count_a, count_b) * vertical_stack
     
     return 0
 
@@ -85,8 +89,7 @@ def get_failure_reason(i_l, i_w, i_h, drawer_db_drawers, clearance_mm):
     elif item_dims[1] > eff_max_large:
         reasons.append(f"Max Length {item_dims[1]}mm > Max Usable Length {eff_max_large:.1f}mm")
         
-    if not reasons:
-        return "Complex Fit Issue (Shape/Volume)"
+    if not reasons: return "Complex Fit Issue (Shape/Volume)"
     return "; ".join(reasons)
 
 def consolidate_drawers(item_results, drawer_db_drawers, clearance_mm):
@@ -101,9 +104,7 @@ def consolidate_drawers(item_results, drawer_db_drawers, clearance_mm):
             capacity = props['QtyBins']
             
             if capacity == 0: 
-                drawers_needed = 0
-                free_slots = 0
-                remainder = 0
+                drawers_needed = 0; free_slots = 0; remainder = 0
             else:
                 drawers_needed = math.ceil(total_bins / capacity)
                 bins_available_total = drawers_needed * capacity
@@ -201,19 +202,19 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                     upgrades_possible = row['Drawers Required']
                     upgrades_needed = math.ceil(gap / 3)
                     upgrades_to_perform = min(upgrades_possible, upgrades_needed)
-                    
                     if upgrades_to_perform > 0:
                         gap_filled = upgrades_to_perform * 3
                         
-                        # Calculate proportional bin usage
-                        # Assumption: bins are distributed evenly among drawers
-                        avg_bins_per_drawer = row['Total Bins Used'] / row['Drawers Required']
+                        avg_bins_per_drawer = 0
+                        if row['Drawers Required'] > 0:
+                            avg_bins_per_drawer = float(str(row['Total Bins Used']).split(' of ')[0]) / row['Drawers Required']
+                        
                         bins_moving = avg_bins_per_drawer * upgrades_to_perform
                         
                         new_rows.append({
                             "Drawer Type": target_type,
                             "Drawer Height": 6,
-                            "Total Bins Used": bins_moving, # Carry over the usage count
+                            "Total Bins Used": bins_moving,
                             "Drawers Required": upgrades_to_perform,
                             "Unit Price": f"${price_map.get(target_type,0):,.2f}",
                             "Total Price": upgrades_to_perform * price_map.get(target_type,0),
@@ -223,13 +224,14 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
                         
                         remaining = upgrades_possible - upgrades_to_perform
                         if remaining > 0:
+                            current_bins_used = float(str(row['Total Bins Used']).split(' of ')[0])
                             row['Drawers Required'] = remaining
                             row['Vertical Space (in)'] = remaining * 3
-                            row['Total Bins Used'] = row['Total Bins Used'] - bins_moving # Adjust remaining
+                            row['Total Bins Used'] = current_bins_used - bins_moving
                             unit_p = float(str(row['Unit Price']).replace('$','').replace(',',''))
                             row['Total Price'] = remaining * unit_p
                             new_rows.append(row.to_dict())
-                            
+                        
                         changes_log.append(f"Expanded {int(upgrades_to_perform)}x {d_type} to {target_type}")
                         gap -= gap_filled
                         continue 
@@ -259,10 +261,7 @@ def fill_cabinet_gaps(summary_df, total_height_current, strategy, drawer_db_full
 
 @st.cache_data
 def build_product_map(prod_df):
-    """
-    Creates a master dictionary for O(1) matching.
-    Cached to run only once per file upload.
-    """
+    """Cached Product Indexer."""
     product_map = {}
     for idx, row in prod_df.iterrows():
         l = row.get('Length Packed Product Metric', 0)
@@ -298,12 +297,10 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
     item_results = []
     no_fit_results = []
     
-    # Prepare Drawer DB
     drawer_db_drawers = drawer_db_full[drawer_db_full['BinWidth'].notna()].copy()
     cost_rows = drawer_db_full[drawer_db_full['BinWidth'].isna()]
     
-    base_cabinet_cost = 0
-    shipping_cost = 0
+    base_cabinet_cost = 0; shipping_cost = 0
     for _, row in cost_rows.iterrows():
         name = str(row['DrawerID']).lower()
         price = float(row['Price']) if pd.notnull(row['Price']) else 0
@@ -315,15 +312,12 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
         if col == 'Price': drawer_db_drawers[col] = pd.to_numeric(drawer_db_drawers[col], errors='coerce').fillna(0)
         else: drawer_db_drawers[col] = pd.to_numeric(drawer_db_drawers[col], errors='coerce')
 
-    # Main Processing Loop
     for index, row in inventory_df.iterrows():
         input_code_raw = row['Material ID/ Product Code']
         match_id = clean_code_str(input_code_raw)
         req_qty_pieces = float(row['Quantity'])
         
-        # 1. Lookup Product Data
         prod_data = product_map.get(match_id)
-        
         if prod_data:
             i_l, i_w, i_h = prod_data['L'], prod_data['W'], prod_data['H']
             pkg_qty = prod_data['PkgQty']
@@ -341,7 +335,6 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
             else:
                 continue
 
-        # 2. Optimization Logic
         best_drawer_id = None
         min_cost_share = float('inf')
         selected_bins_needed = 0
@@ -420,7 +413,6 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
         type_cost_total = drawers_count * price_per_drawer
         total_cabinet_height += type_height_total
         
-        # Kept as float for calculation, will format later
         summary_list.append({
             "Drawer Type": d_type,
             "Drawer Height": d_height,
@@ -435,27 +427,23 @@ def optimize_packing(inventory_df, drawer_db_full, product_map, enable_consolida
     summary_df = pd.DataFrame(summary_list)
     summary_df, total_cabinet_height, fill_logs = fill_cabinet_gaps(summary_df, total_cabinet_height, fill_strategy, drawer_db_full)
     
-    # --- FINAL FORMATTING PASS (X of Y) ---
+    # Format Usage Column
     formatted_rows = []
     for idx, row in summary_df.iterrows():
         d_type = row['Drawer Type']
-        bins_used = row['Total Bins Used']
+        bins_used = float(row['Total Bins Used']) # Ensure float
         drawers = row['Drawers Required']
-        
-        # Look up capacity per drawer
         cap_per_drawer = drawer_caps.get(d_type, 0)
         total_cap = drawers * cap_per_drawer
         
-        # Format "X of Y"
         if total_cap > 0:
             row['Total Bins Used'] = f"{int(bins_used)} of {int(total_cap)}"
         else:
-            row['Total Bins Used'] = "0 of 0" # Empty drawers
+            row['Total Bins Used'] = "0 of 0"
             
         formatted_rows.append(row)
     
     summary_df = pd.DataFrame(formatted_rows)
-    # --------------------------------------
 
     total_drawer_cost = summary_df['Total Price'].sum()
     cabinets_needed = math.ceil(total_cabinet_height / 33) if total_cabinet_height > 0 else 0
@@ -522,18 +510,19 @@ fill_strat = st.sidebar.selectbox("Cabinet Gap Filling Strategy", ["expand", "em
 
 if inv_file and prod_file and draw_file:
     try:
-        # Load Files
-        inv_df = pd.read_excel(inv_file)
-        
-        if prod_file.name.endswith('.csv'):
-            prod_df = pd.read_csv(prod_file)
-        else:
-            prod_df = pd.read_excel(prod_file)
+        # Load Files with Spinners
+        with st.spinner("Loading Files..."):
+            inv_df = pd.read_excel(inv_file)
             
-        if draw_file.name.endswith('.csv'):
-            draw_df = pd.read_csv(draw_file)
-        else:
-            draw_df = pd.read_excel(draw_file)
+            if prod_file.name.endswith('.csv'):
+                prod_df = pd.read_csv(prod_file)
+            else:
+                prod_df = pd.read_excel(prod_file)
+                
+            if draw_file.name.endswith('.csv'):
+                draw_df = pd.read_csv(draw_file)
+            else:
+                draw_df = pd.read_excel(draw_file)
 
         # Standardize headers
         inv_df.columns = inv_df.columns.str.strip()
@@ -541,7 +530,7 @@ if inv_file and prod_file and draw_file:
         draw_df.columns = draw_df.columns.str.strip()
         
         # --- BUILD INDEX (CACHED) ---
-        with st.spinner("Indexing Product DB..."):
+        with st.spinner("Indexing Product DB (this only happens once)..."):
             product_map = build_product_map(prod_df)
 
         st.subheader("Step 1: Data Matching")
@@ -577,7 +566,7 @@ if inv_file and prod_file and draw_file:
                 final_df_to_process = valid_df
                 ready_to_calculate = True
             else:
-                st.info("Fix or enable Skip.")
+                st.info("To proceed, upload fixed data OR enable 'Skip missing items' in Settings.")
                 c1, c2 = st.columns(2)
                 with c1:
                     buffer = io.BytesIO()
@@ -600,7 +589,7 @@ if inv_file and prod_file and draw_file:
         if ready_to_calculate:
             st.divider()
             if st.button("🚀 Calculate", type="primary"):
-                with st.spinner("Optimizing..."):
+                with st.spinner("Running Optimization Algorithms..."):
                     
                     detail_df, summary_df, costs, no_fit_df, logs = optimize_packing(
                         final_df_to_process, 
@@ -652,3 +641,6 @@ if inv_file and prod_file and draw_file:
 
     except Exception as e:
         st.error(f"Error: {e}")
+
+else:
+    st.info("Waiting for file uploads...")
